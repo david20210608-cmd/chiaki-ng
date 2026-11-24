@@ -1,3 +1,5 @@
+#include <QtGlobal>
+
 #ifdef Q_OS_WINDOWS
 
 #include "d3d11presenter.h"
