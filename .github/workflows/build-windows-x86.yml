@@ -188,7 +188,8 @@ jobs:
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\libssl-*-x64.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\SDL2.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\SDL3.dll" chiaki-ng-Win
-          cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\hidapi.dll" chiaki-ng-Win
+          # the 2026-10 baseline's sdl2 may not pull hidapi at all
+          Get-ChildItem "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin" -Filter "hidapi*.dll" -ErrorAction SilentlyContinue | cp -Destination chiaki-ng-Win
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\fftw3.dll" chiaki-ng-Win
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\opus.dll" chiaki-ng-Win
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\libspeexdsp.dll" chiaki-ng-Win
