@@ -100,9 +100,9 @@ jobs:
       - name: Setup shaderc
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $url = ((Invoke-WebRequest -UseBasicParsing -Uri "https://storage.googleapis.com/shaderc/badges/build_link_windows_vs2019_release.html").Content | Select-String -Pattern 'url=(.*)"').Matches.Groups[1].Value
-          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile .\shaderc.zip
-          Expand-Archive -LiteralPath "shaderc.zip" -DestinationPath "."
+          $url = ((curl.exe -s "https://storage.googleapis.com/shaderc/badges/build_link_windows_vs2022_amd64_release.html") | Select-String -Pattern 'url=(.*)"').Matches.Groups[1].Value
+          curl.exe -sL $url -o .\shaderc.tgz
+          tar -xzf shaderc.tgz
           cp "./install/*" "./${{ env.dep_folder }}" -Force -Recurse
           rm "./install" -r -force
 
