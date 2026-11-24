@@ -100,9 +100,10 @@ jobs:
       - name: Setup shaderc
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $url = ((curl.exe -s "https://storage.googleapis.com/shaderc/badges/build_link_windows_vs2022_amd64_release.html") | Select-String -Pattern 'url=(.*)"').Matches.Groups[1].Value
-          curl.exe -sL $url -o .\shaderc.tgz
-          tar -xzf shaderc.tgz
+          # The shaderc badge now points at a pruned artifact; pin the latest
+          # build that still exists in the bucket (2026-06-30).
+          curl.exe -sL "https://storage.googleapis.com/shaderc/artifacts/prod/graphics_shader_compiler/shaderc/windows-vs2022-amd64-release/continuous/27/20260630-142440/install.zip" -o .\shaderc.zip
+          Expand-Archive -LiteralPath "shaderc.zip" -DestinationPath "."
           cp "./install/*" "./${{ env.dep_folder }}" -Force -Recurse
           rm "./install" -r -force
 
