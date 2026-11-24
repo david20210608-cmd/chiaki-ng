@@ -361,6 +361,8 @@ class Settings : public QObject
 		void SetHardwareDecoder(const QString &hw_decoder);
 		bool GetUseZeroCopy() const { return settings.value("settings/use_zero_copy", true).toBool(); }
 		void SetUseZeroCopy(bool enabled) { settings.setValue("settings/use_zero_copy", enabled); }
+		bool GetDirectPresentD3D11() const { return settings.value("settings/direct_present_d3d11", true).toBool(); }
+		void SetDirectPresentD3D11(bool enabled) { settings.setValue("settings/direct_present_d3d11", enabled); }
 		bool GetVulkanDeferredSwap() const { return settings.value("settings/vulkan_deferred_swap", false).toBool(); }
 		void SetVulkanDeferredSwap(bool enabled) { settings.setValue("settings/vulkan_deferred_swap", enabled); }
 

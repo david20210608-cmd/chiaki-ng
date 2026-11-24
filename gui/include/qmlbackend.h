@@ -25,6 +25,7 @@ class SystemdInhibit;
     class MacWakeSleep;
 #elif defined(Q_OS_WINDOWS)
     class WindowsWakeSleep;
+    class D3D11Presenter;
 #endif
 
 class QmlRegist : public QObject
@@ -305,6 +306,7 @@ private:
     MacWakeSleep *mac_wake_sleep = {};
 #elif defined(Q_OS_WINDOWS)
     WindowsWakeSleep *windows_wake_sleep = {};
+    D3D11Presenter *d3d11_presenter = {};
 #endif
     bool controller_mapping_default_mapping = false;
     bool controller_mapping_altered = false;

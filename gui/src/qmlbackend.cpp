@@ -11,6 +11,7 @@
 #include "macWakeSleep.h"
 #elif defined(Q_OS_WINDOWS)
 #include "windowsWakeSleep.h"
+#include "d3d11presenter.h"
 #endif
 #if CHIAKI_GUI_ENABLE_STEAM_SHORTCUT
 #include "steamtools.h"
@@ -526,6 +527,11 @@ void QmlBackend::teardownSession()
     chiaki_log_mutex.lock();
     chiaki_log_ctx = nullptr;
     chiaki_log_mutex.unlock();
+
+#ifdef Q_OS_WINDOWS
+    if (d3d11_presenter)
+        d3d11_presenter->stop();
+#endif
 
     // 1) Stop any new signal deliveries from the session, most importantly the
     //    frame-thread FfmpegFrameAvailable handler.
@@ -1079,6 +1085,22 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 #endif
     }
     fallbackVulkanDecoderForOpenGL();
+#ifdef Q_OS_WINDOWS
+    if (session_info.hw_decoder == "d3d11va" && settings->GetDirectPresentD3D11()
+        && session_info.video_profile.codec != CHIAKI_CODEC_H265_HDR) {
+        if (!d3d11_presenter)
+            d3d11_presenter = new D3D11Presenter(this);
+        if (d3d11_presenter->initialize(window,
+                static_cast<int>(session_info.video_profile.width),
+                static_cast<int>(session_info.video_profile.height))) {
+            session_info.hw_device_ctx = d3d11_presenter->avHwDeviceCtx();
+            qCInfo(chiakiGui) << "Using D3D11 direct presentation for this session";
+        } else {
+            d3d11_presenter->stop();
+            qCInfo(chiakiGui) << "D3D11 direct presentation unavailable, using regular render path";
+        }
+    }
+#endif
     if (session_info.hw_decoder == "vulkan") {
         session_info.hw_device_ctx = window->vulkanHwDeviceCtx();
         if (!session_info.hw_device_ctx)
@@ -1136,6 +1158,12 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             pending_recovered_frame.storeRelaxed(1);
 
         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+#ifdef Q_OS_WINDOWS
+        if (d3d11_presenter && d3d11_presenter->active() && d3d11_presenter->presentD3D11Frame(frame.frame)) {
+            av_frame_free(&frame.frame);
+            return;
+        }
+#endif
         if (!prepareFrameForPresentation(frame, use_opengl_renderer))
         {
             av_frame_free(&frame.frame);
