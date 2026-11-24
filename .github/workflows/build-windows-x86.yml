@@ -119,6 +119,14 @@ jobs:
           Expand-Archive cmake331.zip -DestinationPath C:\cmake331
           echo "C:\cmake331\cmake-3.31.6-windows-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Setup pkg-config
+        run: |
+          # The pinned 2024-02 vcpkg downloads pkgconf from an msys2 URL that
+          # has since been purged from the mirrors; providing PKG_CONFIG
+          # ourselves makes vcpkg_find_acquire_program skip that download.
+          choco install pkgconfiglite -y --no-progress
+          echo "PKG_CONFIG=C:\ProgramData\chocolatey\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
