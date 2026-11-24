@@ -111,6 +111,14 @@ jobs:
         run: |
           mkdir build
 
+      - name: Setup CMake 3.31
+        run: |
+          # CMake 4 removed compatibility with cmake_minimum_required < 3.5,
+          # which the pinned vcpkg baseline's older ports (json-c, ...) need.
+          curl.exe -sL "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip" -o cmake331.zip
+          Expand-Archive cmake331.zip -DestinationPath C:\cmake331
+          echo "C:\cmake331\cmake-3.31.6-windows-x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
