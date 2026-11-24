@@ -190,7 +190,7 @@ jobs:
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\SDL3.dll" chiaki-ng-Win
           # the 2026-10 baseline may not pull every optional DLL (hidapi,
           # fftw3); warn instead of failing on those, copy the rest
-          foreach ($name in @("hidapi*.dll","fftw3.dll","opus.dll","libspeexdsp.dll","lcms2.dll","miniupnpc.dll","json-c.dll")) {
+          foreach ($name in @("hidapi*.dll","fftw3.dll","opus.dll","libspeexdsp.dll","*lcms*.dll","miniupnpc.dll","json-c.dll")) {
             $found = Get-ChildItem "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin" -Filter $name -ErrorAction SilentlyContinue
             if ($found) { $found | cp -Destination chiaki-ng-Win } else { echo "WARNING: $name not found in vcpkg bin" }
           }
