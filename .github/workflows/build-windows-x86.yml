@@ -15,7 +15,9 @@ jobs:
       CXX: clang-cl.exe
       VULKAN_SDK: C:\VulkanSDK\
       triplet: x64-windows
-      vcpkg_baseline: 42bb0d9e8d4cf33485afb9ee2229150f79f61a1f
+      # 2026-10-02: first commit with dynamic msys2 package resolution (no
+      # more dead pinned-URL downloads for pkgconf and friends).
+      vcpkg_baseline: 2200159cd465157f20133e363e4604ac4d68181b
       dep_folder: deps
       libplacebo_tag: v7.387.0
       sdl2_compat_tag: 2.32.74
