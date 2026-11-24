@@ -7,6 +7,7 @@
 #include "qmlmainwindow.h"
 
 #include <d3d11.h>
+#include <d3d11_4.h> // ID3D11Multithread lives here, not in d3d11.h
 #include <dxgi1_2.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
@@ -171,9 +172,6 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 		return false;
 	}
 
-	BOOL enable = TRUE;
-	video_context->VideoProcessorSetStreamEnable(video_processor, 0, enable);
-
 	D3D11_VIDEO_PROCESSOR_COLOR_SPACE stream_color = {};
 	stream_color.YCbCr_Matrix = 1; // BT.709
 	stream_color.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
@@ -328,7 +326,7 @@ bool D3D11Presenter::ensureOutputSize(int width, int height)
 		dst_w = static_cast<LONG>(static_cast<double>(height) * stream_width / stream_height);
 	}
 	RECT dest = { (width - dst_w) / 2, (height - dst_h) / 2, (width - dst_w) / 2 + dst_w, (height - dst_h) / 2 + dst_h };
-	video_context->VideoProcessorSetStreamDestinationRect(video_processor, 0, TRUE, &dest);
+	video_context->VideoProcessorSetStreamDestRect(video_processor, 0, TRUE, &dest);
 
 	HRESULT hr = swapchain->ResizeBuffers(2, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
 	if(FAILED(hr))
@@ -385,7 +383,7 @@ bool D3D11Presenter::presentD3D11Frame(AVFrame *frame)
 	return presentSurface(decoder_texture, array_slice);
 }
 
-bool D3D11Presenter::presentSurface(ID3D11Texture2D *decoder_texture, UINT array_slice)
+bool D3D11Presenter::presentSurface(ID3D11Texture2D *decoder_texture, unsigned int array_slice)
 {
 	// Copy the decoder surface into our own NV12 texture so the video processor
 	// input view does not depend on driver quirks around D3D11_BIND_DECODER

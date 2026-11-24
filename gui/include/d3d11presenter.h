@@ -38,7 +38,7 @@ class D3D11Presenter : public QObject
 	private:
 		bool ensureOutputSize(int width, int height);
 		bool updateGeometry();
-		bool presentSurface(ID3D11Texture2D *texture, UINT array_slice);
+		bool presentSurface(ID3D11Texture2D *texture, unsigned int array_slice);
 		void logHrOnce(const char *what, long hr, bool *logged);
 		void cleanupRenderResources();
 
