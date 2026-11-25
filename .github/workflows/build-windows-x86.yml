@@ -61,7 +61,9 @@ jobs:
           version: "6.10.*"
           host: 'windows'
           target: 'desktop'
-          modules: 'qtwebengine qtpositioning qtwebchannel qtwebsockets qtserialport'
+          # No qtwebengine (matches the official MSYS2 release): PSN login
+          # falls back to the system browser, keeping the portable zip small
+          modules: 'qtpositioning qtwebchannel qtwebsockets qtserialport'
 
       - name: Install pip dependencies
         run: |
@@ -183,7 +185,6 @@ jobs:
           mkdir chiaki-ng-Win
           cp build\gui\chiaki.exe chiaki-ng-Win
           cp build\third-party\cpp-steam-tools\cpp-steam-tools.dll chiaki-ng-Win
-          cp scripts\qtwebengine_import.qml gui\src\qml\
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\libcrypto-*-x64.dll" chiaki-ng-Win
           cp "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin\libssl-*-x64.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\SDL2.dll" chiaki-ng-Win
