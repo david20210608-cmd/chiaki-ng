@@ -191,7 +191,7 @@ jobs:
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\SDL3.dll" chiaki-ng-Win
           # the 2026-10 baseline may not pull every optional DLL (hidapi,
           # fftw3); warn instead of failing on those, copy the rest
-          foreach ($name in @("hidapi*.dll","fftw3.dll","opus.dll","libspeexdsp.dll","*lcms*.dll","miniupnpc.dll","json-c.dll")) {
+          foreach ($name in @("hidapi*.dll","fftw3.dll","opus.dll","libspeexdsp.dll","*lcms*.dll","miniupnpc.dll","json-c.dll","event*.dll")) {
             $found = Get-ChildItem "${env:VCPKG_INSTALLED_DIR}\${{ env.triplet }}\bin" -Filter $name -ErrorAction SilentlyContinue
             if ($found) { $found | cp -Destination chiaki-ng-Win } else { echo "WARNING: $name not found in vcpkg bin" }
           }
@@ -203,6 +203,18 @@ jobs:
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\shaderc_shared.dll" chiaki-ng-Win
           cp "${{ github.workspace }}\${{ env.dep_folder }}\bin\spirv-cross-c-shared.dll" chiaki-ng-Win
           windeployqt.exe --no-translations --qmldir=gui\src\qml --release chiaki-ng-Win\chiaki.exe
+          # Fail the build instead of shipping a zip that can't launch: every
+          # non-system DLL imported by the exe and our plugin must be present
+          $system_dlls = '^(?i)(api-ms-|ext-ms-|ntdll|kernel32|user32|gdi32|shell32|ole32|oleaut32|advapi32|ws2_32|shlwapi|comctl32|comdlg32|uxtheme|d3d11|dxgi|dwmapi|winmm|imm32|opengl32|glu32|secur32|crypt32|bcrypt|userenv|wintrust|iphlpapi|dnsapi|dbghelp|setupapi|cfgmgr32|powrprof|msvcrt|ucrtbase|vcruntime|win32u|version|normaliz|dinput8|xinput|winusb|hid|wtsapi32|ntmarta|dcomp|msimg32|ntoskrnl)'
+          foreach ($bin in @("chiaki-ng-Win\chiaki.exe","chiaki-ng-Win\cpp-steam-tools.dll")) {
+            $deps = dumpbin /DEPENDENTS $bin | Select-String '\.dll' | %{$_.ToString().Trim()} | ?{$_ -notmatch $system_dlls}
+            foreach ($dep in $deps) {
+              if (-not (Test-Path "chiaki-ng-Win\$dep")) {
+                throw "Packaged $bin depends on '$dep' which is missing from chiaki-ng-Win"
+              }
+            }
+          }
+          echo "DLL dependency check passed"
 
       - name: Package chiaki-ng
         run: |
