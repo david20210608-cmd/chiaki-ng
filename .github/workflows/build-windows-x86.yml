@@ -205,7 +205,9 @@ jobs:
           windeployqt.exe --no-translations --qmldir=gui\src\qml --release chiaki-ng-Win\chiaki.exe
           # Fail the build instead of shipping a zip that can't launch: every
           # non-system DLL imported by the exe and our plugin must be present
-          $system_dlls = '^(?i)(api-ms-|ext-ms-|ntdll|kernel32|user32|gdi32|shell32|ole32|oleaut32|advapi32|ws2_32|shlwapi|comctl32|comdlg32|uxtheme|d3d11|dxgi|dwmapi|winmm|imm32|opengl32|glu32|secur32|crypt32|bcrypt|userenv|wintrust|iphlpapi|dnsapi|dbghelp|setupapi|cfgmgr32|powrprof|msvcrt|ucrtbase|vcruntime|win32u|version|normaliz|dinput8|xinput|winusb|hid|wtsapi32|ntmarta|dcomp|msimg32|ntoskrnl)'
+          # VC runtime (msvcp*/vcruntime*/concrt) is intentionally excluded:
+          # it comes from the installed VC++ redistributable, like upstream
+          $system_dlls = '^(?i)(api-ms-|ext-ms-|ntdll|kernel32|user32|gdi32|shell32|ole32|oleaut32|advapi32|ws2_32|shlwapi|comctl32|comdlg32|uxtheme|d3d11|dxgi|dwmapi|winmm|imm32|opengl32|glu32|secur32|crypt32|bcrypt|userenv|wintrust|iphlpapi|dnsapi|dbghelp|setupapi|cfgmgr32|powrprof|msvcrt|ucrtbase|vcruntime|msvcp|concrt|win32u|version|normaliz|dinput8|xinput|winusb|hid|wtsapi32|ntmarta|dcomp|msimg32|ntoskrnl)'
           foreach ($bin in @("chiaki-ng-Win\chiaki.exe","chiaki-ng-Win\cpp-steam-tools.dll")) {
             $deps = dumpbin /DEPENDENTS $bin | Select-String '\.dll' | %{$_.ToString().Trim()} | ?{$_ -notmatch $system_dlls}
             foreach ($dep in $deps) {
