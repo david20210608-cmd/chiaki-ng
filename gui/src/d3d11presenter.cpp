@@ -105,9 +105,12 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 		D3D_FEATURE_LEVEL_10_1,
 		D3D_FEATURE_LEVEL_10_0,
 	};
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: calling D3D11CreateDevice";
 	HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
 			feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
 			&device, nullptr, &context);
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: D3D11CreateDevice hr" << QString::number(hr, 16)
+		<< "device" << reinterpret_cast<const void *>(device);
 	if(FAILED(hr))
 	{
 		qCWarning(chiakiGui) << "[d3d11-direct] D3D11CreateDevice failed" << QString::number(hr, 16);
@@ -132,6 +135,9 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	av_lock = new CRITICAL_SECTION;
 	InitializeCriticalSection(reinterpret_cast<CRITICAL_SECTION *>(av_lock));
 	av_hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: av_hwdevice_ctx_alloc" << reinterpret_cast<const void *>(av_hw_device_ctx)
+		<< "sizeof(AVHWDeviceContext)" << sizeof(AVHWDeviceContext)
+		<< "sizeof(AVD3D11VADeviceContext)" << sizeof(AVD3D11VADeviceContext);
 	if(!av_hw_device_ctx)
 	{
 		qCWarning(chiakiGui) << "[d3d11-direct] av_hwdevice_ctx_alloc failed";
@@ -149,16 +155,19 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	context->AddRef();
 	video_device->AddRef();
 	video_context->AddRef();
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: ctx filled, calling av_hwdevice_ctx_init";
 	if(av_hwdevice_ctx_init(av_hw_device_ctx) < 0)
 	{
 		qCWarning(chiakiGui) << "[d3d11-direct] av_hwdevice_ctx_init failed";
 		av_buffer_unref(&av_hw_device_ctx);
 		return false;
 	}
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: av_hwdevice_ctx_init OK";
 
 	stream_width = frame_width;
 	stream_height = frame_height;
 
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: creating VideoProcessorEnumerator";
 	D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc = {};
 	content_desc.InputWidth = stream_width;
 	content_desc.InputHeight = stream_height;
@@ -186,7 +195,9 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	video_context->VideoProcessorSetStreamSourceRect(video_processor, 0, TRUE, &source);
 
 	// Child window covering the QML window's client area.
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: requesting parent winId";
 	HWND parent_hwnd = reinterpret_cast<HWND>(parent_window->winId());
+	qCInfo(chiakiGui) << "[d3d11-diag] presenter: parent_hwnd" << reinterpret_cast<const void *>(parent_hwnd);
 	RECT client_rect;
 	if(!GetClientRect(parent_hwnd, &client_rect))
 	{

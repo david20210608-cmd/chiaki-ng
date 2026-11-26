@@ -33,6 +33,7 @@
 #include <QDesktopServices>
 #include <QtConcurrent>
 #include <QTimer>
+#include <QFile>
 
 extern "C" {
 #include <chiaki/time.h>
@@ -228,6 +229,23 @@ static void msg_handler(QtMsgType type, const QMessageLogContext &context, const
 {
     QMutexLocker lock(&chiaki_log_mutex);
     if (!chiaki_log_ctx) {
+        // No session log exists in this window, so GUI messages would vanish
+        // on a hard crash (GUI subsystem has no stderr). Append to a startup
+        // file so a crash before StreamSession construction leaves evidence.
+        {
+            static QString startup_log_dir;
+            if (startup_log_dir.isEmpty())
+                startup_log_dir = GetLogBaseDir();
+            if (!startup_log_dir.isEmpty()) {
+                QFile f(startup_log_dir + "/gui_startup.log");
+                if (f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                    const char *level = type == QtDebugMsg ? "D" : type == QtInfoMsg ? "I"
+                        : type == QtWarningMsg ? "W" : type == QtCriticalMsg ? "C" : "F";
+                    f.write(QByteArray("[") + level + "] " + msg.toUtf8() + "\n");
+                    f.close();
+                }
+            }
+        }
         qt_msg_handler(type, context, msg);
         return;
     }
@@ -984,6 +1002,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         logged_hw_transfer_failures.clear();
     }
     QStringList availableDecoders = settings_qml->availableDecoders();
+    qCInfo(chiakiGui) << "[d3d11-diag] createSession: hw_decoder =" << session_info.hw_decoder
+        << "available =" << availableDecoders.join(',');
     if (!session_info.hw_decoder.isEmpty()
         && session_info.hw_decoder != "auto"
         && session_info.hw_decoder != "none"
@@ -1088,8 +1108,10 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 #ifdef Q_OS_WINDOWS
     if (session_info.hw_decoder == "d3d11va" && settings->GetDirectPresentD3D11()
         && session_info.video_profile.codec != CHIAKI_CODEC_H265_HDR) {
+        qCInfo(chiakiGui) << "[d3d11-diag] D3D11 direct-present gate taken";
         if (!d3d11_presenter)
             d3d11_presenter = new D3D11Presenter(this);
+        qCInfo(chiakiGui) << "[d3d11-diag] calling D3D11Presenter::initialize";
         if (d3d11_presenter->initialize(window,
                 static_cast<int>(session_info.video_profile.width),
                 static_cast<int>(session_info.video_profile.height))) {
@@ -1102,7 +1124,9 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
     }
 #endif
     if (session_info.hw_decoder == "vulkan") {
+        qCInfo(chiakiGui) << "[d3d11-diag] calling vulkanHwDeviceCtx";
         session_info.hw_device_ctx = window->vulkanHwDeviceCtx();
+        qCInfo(chiakiGui) << "[d3d11-diag] vulkanHwDeviceCtx returned" << session_info.hw_device_ctx;
         if (!session_info.hw_device_ctx)
         {
             session_info.hw_decoder.clear();
@@ -1135,6 +1159,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             qCInfo(chiakiGui) << "Falling back to software decoder";
     }
 
+    qCInfo(chiakiGui) << "[d3d11-diag] hw_device_ctx before StreamSession:" << session_info.hw_device_ctx
+        << "hw_decoder:" << session_info.hw_decoder;
     try {
         session = new StreamSession(session_info, this);
     } catch (const Exception &e) {

@@ -4717,6 +4717,11 @@ AVBufferRef *QmlMainWindow::vulkanHwDeviceCtx()
     }
 
     vulkan_hw_dev_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
+    qCInfo(chiakiGui) << "[d3d11-diag] vulkan ctx alloc" << reinterpret_cast<const void *>(vulkan_hw_dev_ctx)
+        << "sizeof(AVHWDeviceContext)" << sizeof(AVHWDeviceContext)
+        << "sizeof(AVVulkanDeviceContext)" << sizeof(AVVulkanDeviceContext);
+    if(!vulkan_hw_dev_ctx)
+        return nullptr;
     AVHWDeviceContext *hwctx = reinterpret_cast<AVHWDeviceContext*>(vulkan_hw_dev_ctx->data);
     hwctx->user_opaque = const_cast<void*>(reinterpret_cast<const void*>(placebo_vulkan));
     AVVulkanDeviceContext *vkctx = reinterpret_cast<AVVulkanDeviceContext*>(hwctx->hwctx);
@@ -4780,10 +4785,12 @@ AVBufferRef *QmlMainWindow::vulkanHwDeviceCtx()
         auto vk = reinterpret_cast<pl_vulkan>(dev_ctx->user_opaque);
         vk->unlock_queue(vk, queue_family, index);
     };
+    qCInfo(chiakiGui) << "[d3d11-diag] calling av_hwdevice_ctx_init(VULKAN)";
     if (av_hwdevice_ctx_init(vulkan_hw_dev_ctx) < 0) {
         qCWarning(chiakiGui) << "Failed to create Vulkan decode context";
         av_buffer_unref(&vulkan_hw_dev_ctx);
     }
+    qCInfo(chiakiGui) << "[d3d11-diag] av_hwdevice_ctx_init(VULKAN) done, ctx" << reinterpret_cast<const void *>(vulkan_hw_dev_ctx);
 
     return vulkan_hw_dev_ctx;
 }
