@@ -9,6 +9,7 @@
 #include <d3d11.h>
 #include <d3d11_4.h> // ID3D11Multithread lives here, not in d3d11.h
 #include <dxgi1_2.h>
+#include <vector>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/pixfmt.h>
@@ -42,6 +43,16 @@ void D3D11Presenter::cleanupRenderResources()
 {
 	if(av_hw_device_ctx)
 		av_buffer_unref(&av_hw_device_ctx);
+	for(auto *v : cached_input_views)
+	{
+		if(v)
+			v->Release();
+	}
+	cached_input_views.clear();
+	if(cached_input_texture)
+		cached_input_texture->Release();
+	cached_input_texture = nullptr;
+	direct_view_broken = false;
 	if(vp_output_view)
 		vp_output_view->Release();
 	if(video_processor)
@@ -205,6 +216,11 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	RECT source = { 0, 0, static_cast<LONG>(stream_width), static_cast<LONG>(stream_height) };
 	video_context->VideoProcessorSetStreamSourceRect(video_processor, 0, TRUE, &source);
 
+	// Driver-side "auto processing" (denoise/sharpen and friends) is enabled by
+	// default and can cost more than the blit itself; we want the fixed-function
+	// pass-through, nothing else.
+	video_context->VideoProcessorSetStreamAutoProcessingMode(video_processor, 0, FALSE);
+
 	// Child window covering the QML window's client area.
 	qCInfo(chiakiGui) << "[d3d11-diag] presenter: requesting parent winId";
 	HWND parent_hwnd = reinterpret_cast<HWND>(parent_window->winId());
@@ -215,8 +231,6 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 		qCWarning(chiakiGui) << "[d3d11-direct] GetClientRect failed";
 		return false;
 	}
-	POINT origin = { client_rect.left, client_rect.top };
-	MapWindowPoints(parent_hwnd, nullptr, &origin, 1);
 	int win_w = client_rect.right - client_rect.left;
 	int win_h = client_rect.bottom - client_rect.top;
 
@@ -234,9 +248,12 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 		class_registered = true;
 	}
 
+	// Child-window coordinates are relative to the parent's client area; using
+	// screen coordinates here offset the video by the window's screen position
+	// whenever the window was not at (0,0) (i.e. any windowed mode).
 	HWND hwnd = CreateWindowExW(0, child_class, L"",
 			WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-			origin.x, origin.y, win_w, win_h,
+			0, 0, win_w, win_h,
 			parent_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 	if(!hwnd)
 	{
@@ -245,8 +262,8 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	}
 	window_handle = hwnd;
 	parent_qwindow = parent_window;
-	last_x = origin.x;
-	last_y = origin.y;
+	last_x = 0;
+	last_y = 0;
 	last_w = win_w;
 	last_h = win_h;
 
@@ -350,6 +367,8 @@ bool D3D11Presenter::ensureOutputSize(int width, int height)
 	}
 	RECT dest = { (width - dst_w) / 2, (height - dst_h) / 2, (width - dst_w) / 2 + dst_w, (height - dst_h) / 2 + dst_h };
 	video_context->VideoProcessorSetStreamDestRect(video_processor, 0, TRUE, &dest);
+	RECT target = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+	video_context->VideoProcessorSetOutputTargetRect(video_processor, TRUE, &target);
 
 	HRESULT hr = swapchain->ResizeBuffers(2, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
 	if(FAILED(hr))
@@ -373,18 +392,16 @@ bool D3D11Presenter::updateGeometry()
 		return false;
 	int w = client_rect.right - client_rect.left;
 	int h = client_rect.bottom - client_rect.top;
-	POINT origin = { client_rect.left, client_rect.top };
-	MapWindowPoints(parent_hwnd, nullptr, &origin, 1);
 
-	if(w != last_w || h != last_h || origin.x != last_x || origin.y != last_y)
+	if(w != last_w || h != last_h)
 	{
 		if(!SetWindowPos(reinterpret_cast<HWND>(window_handle), nullptr,
-					origin.x, origin.y, w, h, SWP_NOACTIVATE | SWP_NOZORDER))
+					0, 0, w, h, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER))
 			return false;
 		if(!ensureOutputSize(w, h))
 			return false;
-		last_x = origin.x;
-		last_y = origin.y;
+		last_x = 0;
+		last_y = 0;
 		last_w = w;
 		last_h = h;
 	}
@@ -424,22 +441,50 @@ bool D3D11Presenter::presentSurface(ID3D11Texture2D *decoder_texture, unsigned i
 {
 	// Prefer wrapping the decoder surface directly: input views on
 	// D3D11_BIND_DECODER textures are the canonical VideoProcessor path.
-	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {};
-	in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-	in_desc.Texture2D.MipSlice = 0;
-	in_desc.Texture2D.ArraySlice = array_slice;
+	// Views are cached per pool texture so they are created once, not per frame.
 	ID3D11VideoProcessorInputView *input_view = nullptr;
-	ID3D11Texture2D *input_texture = decoder_texture;
-	HRESULT view_hr = video_device->CreateVideoProcessorInputView(input_texture, vp_enumerator, &in_desc, &input_view);
-	if(FAILED(view_hr))
+	ID3D11VideoProcessorInputView *owned_view = nullptr;
+	if(!direct_view_broken)
+	{
+		if(decoder_texture != cached_input_texture)
+		{
+			for(auto *v : cached_input_views)
+				v->Release();
+			cached_input_views.clear();
+			if(cached_input_texture)
+				cached_input_texture->Release();
+			cached_input_texture = decoder_texture;
+			cached_input_texture->AddRef();
+		}
+		if(array_slice >= cached_input_views.size())
+			cached_input_views.resize(array_slice + 1, nullptr);
+		input_view = cached_input_views[array_slice];
+		if(!input_view)
+		{
+			D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {};
+			in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+			in_desc.Texture2D.MipSlice = 0;
+			in_desc.Texture2D.ArraySlice = array_slice;
+			HRESULT view_hr = video_device->CreateVideoProcessorInputView(decoder_texture, vp_enumerator, &in_desc, &input_view);
+			if(SUCCEEDED(view_hr))
+			{
+				cached_input_views[array_slice] = input_view;
+			}
+			else
+			{
+				static bool direct_view_logged = false;
+				logHrOnce("VideoProcessorInputView on decoder surface", view_hr, &direct_view_logged);
+				input_view = nullptr;
+				direct_view_broken = true;
+			}
+		}
+	}
+	if(!input_view)
 	{
 		// Fallback: copy into our own single-slice NV12 texture. Copying the
 		// selected slice into slice 0 avoids cloning the decoder pool's array
 		// size; note RT bind flags on NV12 are not universally supported, so
 		// the create failure is logged with its real HRESULT.
-		static bool direct_view_logged = false;
-		logHrOnce("VideoProcessorInputView on decoder surface", view_hr, &direct_view_logged);
-
 		D3D11_TEXTURE2D_DESC want;
 		decoder_texture->GetDesc(&want);
 		want.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -469,26 +514,27 @@ bool D3D11Presenter::presentSurface(ID3D11Texture2D *decoder_texture, unsigned i
 		}
 
 		context->CopySubresourceRegion(nv12_texture, 0, 0, 0, 0, decoder_texture, array_slice, nullptr);
+		D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {};
+		in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+		in_desc.Texture2D.MipSlice = 0;
 		in_desc.Texture2D.ArraySlice = 0;
-		input_texture = nv12_texture;
-		HRESULT copy_view_hr = video_device->CreateVideoProcessorInputView(input_texture, vp_enumerator, &in_desc, &input_view);
+		HRESULT copy_view_hr = video_device->CreateVideoProcessorInputView(nv12_texture, vp_enumerator, &in_desc, &owned_view);
 		if(FAILED(copy_view_hr))
 		{
 			static bool view_logged = false;
 			logHrOnce("VideoProcessorInputView on copy", copy_view_hr, &view_logged);
 			return false;
 		}
+		input_view = owned_view;
 	}
 
 	D3D11_VIDEO_PROCESSOR_STREAM stream = {};
 	stream.Enable = TRUE;
 	stream.pInputSurface = input_view;
 
-	RECT output_rect = { 0, 0, static_cast<LONG>(output_width), static_cast<LONG>(output_height) };
-	video_context->VideoProcessorSetOutputTargetRect(video_processor, TRUE, &output_rect);
-
 	HRESULT hr = video_context->VideoProcessorBlt(video_processor, vp_output_view, 0, 1, &stream);
-	input_view->Release();
+	if(owned_view)
+		owned_view->Release();
 	if(FAILED(hr))
 	{
 		static bool blt_logged = false;

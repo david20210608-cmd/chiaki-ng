@@ -2,6 +2,8 @@
 
 #include <QtGlobal>
 
+#include <vector>
+
 #ifdef Q_OS_WINDOWS
 
 #include <QObject>
@@ -16,6 +18,7 @@ struct ID3D11VideoContext;
 struct ID3D11VideoDevice;
 struct ID3D11VideoProcessor;
 struct ID3D11VideoProcessorEnumerator;
+struct ID3D11VideoProcessorInputView;
 struct ID3D11VideoProcessorOutputView;
 struct IDXGISwapChain1;
 
@@ -52,6 +55,10 @@ class D3D11Presenter : public QObject
 		int last_w = -1;
 		int last_h = -1;
 		int direct_failure_streak = 0;
+		bool direct_view_broken = false;
+
+		ID3D11Texture2D *cached_input_texture = nullptr; // decoder pool texture
+		std::vector<ID3D11VideoProcessorInputView *> cached_input_views;
 
 		void *window_handle = nullptr; // child HWND
 		QWindow *parent_qwindow = nullptr;
