@@ -85,6 +85,8 @@ elseif(WIN32)
 	list(APPEND SOURCE_FILES
 		include/windowsWakeSleep.h
 		src/windowsWakeSleep.cpp
+		include/d3d11presenter.h
+		src/d3d11presenter.cpp
 	)
 endif()
 
@@ -116,6 +118,9 @@ if (${Qt6WebEngineQuick_FOUND})
 	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_WEBENGINE)
 endif()
 target_link_libraries(chiaki SDL2::SDL2)
+if(WIN32)
+	target_link_libraries(chiaki d3d11 dxgi)
+endif()
 if(CHIAKI_ENABLE_SPEEX)
   target_link_libraries(chiaki PkgConfig::SpeexDSP)
   target_compile_definitions(chiaki PRIVATE CHIAKI_GUI_ENABLE_SPEEX)

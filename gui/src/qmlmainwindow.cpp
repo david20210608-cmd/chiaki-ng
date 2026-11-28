@@ -18,6 +18,9 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#if defined(Q_OS_WIN)
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
 }
 
 #include <QByteArray>
@@ -2199,12 +2202,121 @@ static void placebo_log_cb(void *user, pl_log_level level, const char *msg)
     }
 }
 
+#if defined(Q_OS_WIN)
+// libplacebo's pl_map_avframe has no D3D11 hardware interop, so d3d11va frames
+// are imported manually: each NV12/P010 plane is wrapped as a typed shader view
+// of the decoder texture array slice (the same video-views pattern mpv uses).
+
+namespace {
+static const char d3d11frame_magic = 0;
+
+struct pl_d3d11frame_priv {
+    const void *magic;
+    AVFrame *avframe; // pins the d3d11va pool slot while libplacebo samples it
+};
+
+static bool is_d3d11_mapped(const struct pl_frame *frame)
+{
+    auto *priv = static_cast<const pl_d3d11frame_priv *>(frame->user_data);
+    return priv && priv->magic == &d3d11frame_magic;
+}
+
+static bool map_d3d11_frame(pl_gpu gpu, struct pl_frame *out_frame, AVFrame *frame)
+{
+    const AVHWFramesContext *hwfc = frame->hw_frames_ctx
+        ? reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data) : nullptr;
+    const AVPixelFormat sw = hwfc ? static_cast<AVPixelFormat>(hwfc->sw_format) : AV_PIX_FMT_NONE;
+    DXGI_FORMAT luma_fmt, chroma_fmt;
+    if (sw == AV_PIX_FMT_NV12) {
+        luma_fmt = DXGI_FORMAT_R8_UNORM;
+        chroma_fmt = DXGI_FORMAT_R8G8_UNORM;
+    } else if (sw == AV_PIX_FMT_P010LE) {
+        luma_fmt = DXGI_FORMAT_R16_UNORM;
+        chroma_fmt = DXGI_FORMAT_R16G16_UNORM;
+    } else {
+        return false;
+    }
+
+    // Fills planes/mappings/repr.sys/color (incl. HDR side data)/crop/chroma location
+    // from the AVFrame; only repr.bits needs manual setup for hardware frames.
+    pl_frame_from_avframe(out_frame, frame);
+    out_frame->repr.bits = sw == AV_PIX_FMT_NV12
+        ? (struct pl_bit_encoding){ .color_depth = 8, .sample_depth = 8, .bit_shift = 0 }
+        : (struct pl_bit_encoding){ .color_depth = 10, .sample_depth = 16, .bit_shift = 6 };
+
+    ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D *>(frame->data[0]);
+    int slice = static_cast<int>(reinterpret_cast<intptr_t>(frame->data[1]));
+    // The wrap size must be the full SRV view domain (pool textures are aligned
+    // well beyond the active frame, e.g. 1080 -> 1152 rows), because the
+    // renderer maps frame crop to normalized texcoords over the whole view.
+    // Declaring only the active size made the bottom ~6% of the image sample
+    // the decoder alignment padding, whose chroma rows are zero (green band).
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    struct pl_d3d11_wrap_params luma_params = {
+        .tex = reinterpret_cast<ID3D11Resource *>(texture),
+        .array_slice = slice,
+        .fmt = luma_fmt,
+        .w = static_cast<int>(desc.Width),
+        .h = static_cast<int>(desc.Height),
+    };
+    struct pl_d3d11_wrap_params chroma_params = {
+        .tex = reinterpret_cast<ID3D11Resource *>(texture),
+        .array_slice = slice,
+        .fmt = chroma_fmt,
+        .w = static_cast<int>(desc.Width / 2),
+        .h = static_cast<int>(desc.Height / 2),
+    };
+    out_frame->planes[0].texture = pl_d3d11_wrap(gpu, &luma_params);
+    out_frame->planes[1].texture = pl_d3d11_wrap(gpu, &chroma_params);
+    if (!out_frame->planes[0].texture || !out_frame->planes[1].texture) {
+        qCWarning(chiakiGui) << "[d3d11-backend] pl_d3d11_wrap failed, falling back to software path";
+        if (out_frame->planes[0].texture)
+            pl_tex_destroy(gpu, &out_frame->planes[0].texture);
+        if (out_frame->planes[1].texture)
+            pl_tex_destroy(gpu, &out_frame->planes[1].texture);
+        return false;
+    }
+
+    out_frame->user_data = new pl_d3d11frame_priv{ &d3d11frame_magic, av_frame_clone(frame) };
+    return true;
+}
+
+static void unmap_d3d11_frame(pl_gpu gpu, struct pl_frame *frame)
+{
+    auto *priv = static_cast<pl_d3d11frame_priv *>(frame->user_data);
+    for (int i = 0; i < frame->num_planes; i++)
+        pl_tex_destroy(gpu, &frame->planes[i].texture);
+    av_frame_free(&priv->avframe);
+    delete priv;
+    memset(frame, 0, sizeof(*frame));
+}
+}
+#endif
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex,
                       const struct pl_source_frame *src,
                       struct pl_frame *out_frame)
 {
     AVFrame *frame = reinterpret_cast<AVFrame *>(src->frame_data);
     QmlMainWindow *q = reinterpret_cast<QmlMainWindow *>(frame->opaque);
+
+    if (frame->format == AV_PIX_FMT_D3D11) {
+#if defined(Q_OS_WIN)
+        if (map_d3d11_frame(gpu, out_frame, frame))
+            return true;
+        qCWarning(chiakiGui) << "Failed to map D3D11 AVFrame to Placebo frame!";
+        if (q && q->getBackend() && q->getBackend()->zeroCopy()) {
+            qCInfo(chiakiGui) << "Mapping frame failed, trying without zero copy!";
+            q->getBackend()->disableZeroCopy();
+        }
+        av_frame_free(&frame);
+        return false;
+#else
+        return false;
+#endif
+    }
+
     pl_avframe_params av_params{
         .frame      = frame,
         .tex        = tex,};
@@ -2242,6 +2354,14 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex,
 static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
                         const struct pl_source_frame *src)
 {
+#if defined(Q_OS_WIN)
+    if (is_d3d11_mapped(frame)) {
+        unmap_d3d11_frame(gpu, frame);
+        AVFrame *av_frame = reinterpret_cast<AVFrame *>(src->frame_data);
+        av_frame_free(&av_frame);
+        return;
+    }
+#endif
     pl_unmap_avframe(gpu, frame);
     AVFrame *av_frame = reinterpret_cast<AVFrame *>(src->frame_data);
     av_frame_free(&av_frame);
@@ -2506,6 +2626,10 @@ pl_gpu QmlMainWindow::placeboGpu() const
         return placebo_vulkan->gpu;
     if (placebo_opengl)
         return placebo_opengl->gpu;
+#if defined(Q_OS_WIN)
+    if (placebo_d3d11)
+        return placebo_d3d11->gpu;
+#endif
     return nullptr;
 }
 
@@ -2592,6 +2716,10 @@ QmlMainWindow::~QmlMainWindow()
 
     if (render_backend == RenderBackend::Vulkan)
         av_buffer_unref(&vulkan_hw_dev_ctx);
+#if defined(Q_OS_WIN)
+    if (render_backend == RenderBackend::D3D11)
+        av_buffer_unref(&d3d11_hw_dev_ctx);
+#endif
 
     const bool isOpenGlBackend = render_backend == RenderBackend::OpenGL;
     bool hasOpenGlContextCurrent = isOpenGlBackend && makeOpenGLContextCurrent();
@@ -2619,7 +2747,12 @@ QmlMainWindow::~QmlMainWindow()
 #endif
 
     if (pl_gpu gpu = placeboGpu()) {
-        pl_unmap_avframe(gpu, &direct_frame);
+#if defined(Q_OS_WIN)
+        if (is_d3d11_mapped(&direct_frame))
+            unmap_d3d11_frame(gpu, &direct_frame);
+        else
+#endif
+            pl_unmap_avframe(gpu, &direct_frame);
         if (quick_tex)
             pl_tex_destroy(gpu, &quick_tex);
         for (auto &tex : placebo_tex)
@@ -2687,7 +2820,19 @@ QmlMainWindow::~QmlMainWindow()
     if (render_backend == RenderBackend::Vulkan) {
         pl_vulkan_destroy(&placebo_vulkan);
         pl_vk_inst_destroy(&placebo_vk_inst);
-    } else {
+    }
+#if defined(Q_OS_WIN)
+    else if (render_backend == RenderBackend::D3D11) {
+        if (d3d11_imm_ctx) {
+            d3d11_imm_ctx->Release();
+            d3d11_imm_ctx = nullptr;
+        }
+        if (placebo_d3d11)
+            pl_d3d11_destroy(&placebo_d3d11);
+        DeleteCriticalSection(&d3d11_av_lock);
+    }
+#endif
+    else {
         pl_opengl_destroy(&placebo_opengl);
     }
     delete qt_vk_inst;
@@ -2783,7 +2928,7 @@ void QmlMainWindow::presentStartupWarmupFrame(unsigned width, unsigned height, b
     if (has_video || width == 0 || height == 0)
         return;
 
-    AVFrame *frame = make_startup_warmup_frame(width, height, hdr, render_backend == RenderBackend::OpenGL);
+    AVFrame *frame = make_startup_warmup_frame(width, height, hdr, render_backend != RenderBackend::OpenGL);
     if (!frame)
         return;
     startup_warmup_preserve_next_session_change = true;
@@ -4717,6 +4862,11 @@ AVBufferRef *QmlMainWindow::vulkanHwDeviceCtx()
     }
 
     vulkan_hw_dev_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
+    qCInfo(chiakiGui) << "[d3d11-diag] vulkan ctx alloc" << reinterpret_cast<const void *>(vulkan_hw_dev_ctx)
+        << "sizeof(AVHWDeviceContext)" << sizeof(AVHWDeviceContext)
+        << "sizeof(AVVulkanDeviceContext)" << sizeof(AVVulkanDeviceContext);
+    if(!vulkan_hw_dev_ctx)
+        return nullptr;
     AVHWDeviceContext *hwctx = reinterpret_cast<AVHWDeviceContext*>(vulkan_hw_dev_ctx->data);
     hwctx->user_opaque = const_cast<void*>(reinterpret_cast<const void*>(placebo_vulkan));
     AVVulkanDeviceContext *vkctx = reinterpret_cast<AVVulkanDeviceContext*>(hwctx->hwctx);
@@ -4780,13 +4930,52 @@ AVBufferRef *QmlMainWindow::vulkanHwDeviceCtx()
         auto vk = reinterpret_cast<pl_vulkan>(dev_ctx->user_opaque);
         vk->unlock_queue(vk, queue_family, index);
     };
+    qCInfo(chiakiGui) << "[d3d11-diag] calling av_hwdevice_ctx_init(VULKAN)";
     if (av_hwdevice_ctx_init(vulkan_hw_dev_ctx) < 0) {
         qCWarning(chiakiGui) << "Failed to create Vulkan decode context";
         av_buffer_unref(&vulkan_hw_dev_ctx);
     }
+    qCInfo(chiakiGui) << "[d3d11-diag] av_hwdevice_ctx_init(VULKAN) done, ctx" << reinterpret_cast<const void *>(vulkan_hw_dev_ctx);
 
     return vulkan_hw_dev_ctx;
 }
+
+#if defined(Q_OS_WIN)
+AVBufferRef *QmlMainWindow::d3d11HwDeviceCtx()
+{
+    if (!isD3D11Backend() || !placebo_d3d11)
+        return nullptr;
+
+    if (d3d11_hw_dev_ctx)
+        return d3d11_hw_dev_ctx;
+
+    d3d11_hw_dev_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+    if (!d3d11_hw_dev_ctx) {
+        qCWarning(chiakiGui) << "Failed to alloc D3D11 decode context";
+        return nullptr;
+    }
+    AVD3D11VADeviceContext *d3d11ctx = reinterpret_cast<AVD3D11VADeviceContext *>(
+        reinterpret_cast<AVHWDeviceContext *>(d3d11_hw_dev_ctx->data)->hwctx);
+    d3d11ctx->device = placebo_d3d11->device;
+    d3d11ctx->device_context = d3d11_imm_ctx;
+    // FFmpeg's frame pool takes BindFlags from the device context; without
+    // SHADER_RESOURCE the decoded NV12 textures have no SRV and libplacebo
+    // rejects every frame with "texture->params.sampleable".
+    d3d11ctx->BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+    d3d11ctx->lock = [](void *lock_ctx) { EnterCriticalSection(reinterpret_cast<CRITICAL_SECTION *>(lock_ctx)); };
+    d3d11ctx->unlock = [](void *lock_ctx) { LeaveCriticalSection(reinterpret_cast<CRITICAL_SECTION *>(lock_ctx)); };
+    d3d11ctx->lock_ctx = &d3d11_av_lock;
+    placebo_d3d11->device->AddRef();
+    d3d11_imm_ctx->AddRef();
+    if (av_hwdevice_ctx_init(d3d11_hw_dev_ctx) < 0) {
+        qCWarning(chiakiGui) << "Failed to create D3D11 decode context";
+        av_buffer_unref(&d3d11_hw_dev_ctx);
+    }
+
+    return d3d11_hw_dev_ctx;
+}
+
+#endif
 
 bool QmlMainWindow::makeOpenGLContextCurrent()
 {
@@ -4928,12 +5117,73 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
             pl_vulkan_destroy(&placebo_vulkan);
         if (placebo_vk_inst)
             pl_vk_inst_destroy(&placebo_vk_inst);
+#if defined(Q_OS_WIN)
+        if (placebo_d3d11)
+            pl_d3d11_destroy(&placebo_d3d11);
+        if (d3d11_imm_ctx) {
+            d3d11_imm_ctx->Release();
+            d3d11_imm_ctx = nullptr;
+        }
+#endif
 
         render_backend = RenderBackend::OpenGL;
         setSurfaceType(QWindow::OpenGLSurface);
         if (!initOpenGLBackend())
             qFatal("Failed initializing OpenGL backend");
     };
+
+#if defined(Q_OS_WIN)
+    auto initD3D11Backend = [&]() -> bool {
+        struct pl_d3d11_params d3d11_params = {
+            .allow_software = true,
+            .min_feature_level = D3D_FEATURE_LEVEL_11_0,
+        };
+        qCInfo(chiakiGui) << "[d3d11-diag] initD3D11Backend: calling pl_d3d11_create";
+        placebo_d3d11 = pl_d3d11_create(placebo_log, &d3d11_params);
+        qCInfo(chiakiGui) << "[d3d11-diag] initD3D11Backend: pl_d3d11_create returned" << reinterpret_cast<const void *>(placebo_d3d11);
+        if (!placebo_d3d11) {
+            qCWarning(chiakiGui) << "Failed to create libplacebo D3D11 backend";
+            return false;
+        }
+        placebo_d3d11->device->GetImmediateContext(&d3d11_imm_ctx);
+        if (!d3d11_imm_ctx) {
+            qCWarning(chiakiGui) << "Failed to get D3D11 immediate context";
+            return false;
+        }
+        // The decoder thread (FFmpeg) and the GUI thread (libplacebo/Qt) share
+        // this device; D3D11 needs explicit opt-in for that.
+        ID3D11Multithread *multithread = nullptr;
+        if (SUCCEEDED(d3d11_imm_ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&multithread)))) {
+            multithread->SetMultithreadProtected(TRUE);
+            multithread->Release();
+        }
+        InitializeCriticalSection(&d3d11_av_lock);
+
+        IDXGIDevice *dxgi_device = nullptr;
+        if (SUCCEEDED(placebo_d3d11->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device)))) {
+            IDXGIAdapter *adapter = nullptr;
+            if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
+                DXGI_ADAPTER_DESC desc = {};
+                if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                    qCInfo(chiakiGui) << "Using D3D11 adapter:" << QString::fromStdWString(desc.Description)
+                        << "feature level" << QString::number(placebo_d3d11->device->GetFeatureLevel(), 16)
+                        << "software" << placebo_d3d11->software;
+                    if (desc.VendorId == 0x1002) {
+                        amd_card = true;
+                        qCInfo(chiakiGui) << "Using amd graphics card";
+                    }
+                    else if (desc.VendorId == 0x10de) {
+                        nvidia_card = true;
+                        qCInfo(chiakiGui) << "Using nvidia graphics card";
+                    }
+                }
+                adapter->Release();
+            }
+            dxgi_device->Release();
+        }
+        return true;
+    };
+#endif
 
     struct pl_log_params log_params = {
         .log_cb = placebo_log_cb,
@@ -5082,7 +5332,14 @@ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
         }
 vulkan_setup_done:
         ;
-    } else {
+    }
+#if defined(Q_OS_WIN)
+    else if (render_backend == RenderBackend::D3D11) {
+        if (!initD3D11Backend())
+            fallbackToOpenGL(QStringLiteral("Failed to create D3D11 device"));
+    }
+#endif
+    else {
         if (!initOpenGLBackend())
             qFatal("Failed initializing OpenGL backend");
     }
@@ -5129,12 +5386,24 @@ renderer_backend_ready:
     quick_render = new RenderControl(this);
 
     QQuickWindow::setDefaultAlphaBuffer(true);
+#if defined(Q_OS_WIN)
+    QQuickWindow::setGraphicsApi(render_backend == RenderBackend::Vulkan ? QSGRendererInterface::Vulkan
+        : render_backend == RenderBackend::D3D11 ? QSGRendererInterface::Direct3D11
+        : QSGRendererInterface::OpenGL);
+#else
     QQuickWindow::setGraphicsApi(render_backend == RenderBackend::Vulkan ? QSGRendererInterface::Vulkan : QSGRendererInterface::OpenGL);
+#endif
     quick_window = new QQuickWindow(quick_render);
     if (render_backend == RenderBackend::Vulkan) {
         quick_window->setVulkanInstance(qt_vk_inst);
         quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromDeviceObjects(placebo_vulkan->phys_device, placebo_vulkan->device, placebo_vulkan->queue_graphics.index));
-    } else {
+    }
+#if defined(Q_OS_WIN)
+    else if (render_backend == RenderBackend::D3D11) {
+        quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromDeviceAndContext(placebo_d3d11->device, d3d11_imm_ctx));
+    }
+#endif
+    else {
         quick_window->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(qt_gl_context));
     }
     quick_window->setColor(QColor(0, 0, 0, 0));
@@ -5279,7 +5548,7 @@ renderer_backend_ready:
     });
     connect(backend, &QmlBackend::windowTypeUpdated, this, &QmlMainWindow::updateWindowType);
 
-    if (render_backend == RenderBackend::OpenGL) {
+    if (rendersOnGuiThread()) {
         render_thread = QGuiApplication::instance()->thread();
         owns_render_thread = false;
     } else {
@@ -5294,19 +5563,26 @@ renderer_backend_ready:
 
     connect(quick_render, &QQuickRenderControl::sceneChanged, this, [this]() {
         armQuickNeedSync("sceneChanged");
-        scheduleUpdate(render_backend != RenderBackend::OpenGL, UpdateRequestReason::SceneChanged);
+        scheduleUpdate(!rendersOnGuiThread(), UpdateRequestReason::SceneChanged);
     });
     connect(quick_render, &QQuickRenderControl::renderRequested, this, [this]() {
         quick_need_render.storeRelaxed(1);
-        scheduleUpdate(render_backend != RenderBackend::OpenGL, UpdateRequestReason::RenderRequested);
+        scheduleUpdate(!rendersOnGuiThread(), UpdateRequestReason::RenderRequested);
     });
 
 
-    if (render_backend == RenderBackend::OpenGL) {
-        if (!makeOpenGLContextCurrent())
-            qFatal("Failed to make QOpenGLContext current for render control initialization");
-        quick_render->initialize();
-        doneOpenGLContextCurrent();
+    if (rendersOnGuiThread()) {
+#if defined(Q_OS_WIN)
+        if (render_backend == RenderBackend::D3D11) {
+            quick_render->initialize();
+        } else
+#endif
+        {
+            if (!makeOpenGLContextCurrent())
+                qFatal("Failed to make QOpenGLContext current for render control initialization");
+            quick_render->initialize();
+            doneOpenGLContextCurrent();
+        }
     } else {
         QMetaObject::invokeMethod(quick_render, &QQuickRenderControl::initialize);
     }
@@ -5446,7 +5722,7 @@ void QmlMainWindow::scheduleUpdate(bool force, UpdateRequestReason reason)
         return;
     }
 
-    const bool ui_priority = render_backend != RenderBackend::OpenGL &&
+    const bool ui_priority = render_backend == RenderBackend::Vulkan &&
         (reason == UpdateRequestReason::SceneChanged ||
          reason == UpdateRequestReason::RenderRequested);
     if (ui_priority) {
@@ -5917,6 +6193,25 @@ void QmlMainWindow::createSwapchain()
     if (placebo_swapchain)
         return;
 
+#if defined(Q_OS_WIN)
+    if (render_backend == RenderBackend::D3D11) {
+        struct pl_d3d11_swapchain_params sw_params = {
+            .window = reinterpret_cast<HWND>(winId()),
+        };
+        qCInfo(chiakiGui) << "[d3d11-diag] createSwapchain: calling pl_d3d11_create_swapchain, hwnd"
+            << reinterpret_cast<const void *>(sw_params.window) << "size" << width() << "x" << height();
+        placebo_swapchain = pl_d3d11_create_swapchain(placebo_d3d11, &sw_params);
+        qCInfo(chiakiGui) << "[d3d11-diag] createSwapchain: pl_d3d11_create_swapchain returned" << reinterpret_cast<const void *>(placebo_swapchain);
+        // libplacebo's D3D11 swapchain always presents with sync interval 1
+        present_vsync_enabled = true;
+        if (!placebo_swapchain)
+            qCCritical(chiakiGui) << "Failed creating D3D11 swapchain";
+        else
+            qCInfo(chiakiGui) << "[d3d11-backend] active" << (placebo_d3d11->software ? "(WARP software device)" : "");
+        return;
+    }
+#endif
+
     if (render_backend == RenderBackend::OpenGL) {
         if (!makeOpenGLContextCurrent()) {
             qCCritical(chiakiGui) << "Failed to make OpenGL context current";
@@ -6084,6 +6379,12 @@ void QmlMainWindow::destroySwapchain()
         delete quick_fbo;
         quick_fbo = nullptr;
     }
+#if defined(Q_OS_WIN)
+    if (quick_d3d11_tex) {
+        quick_d3d11_tex->Release();
+        quick_d3d11_tex = nullptr;
+    }
+#endif
     swapchain_size = QSize();
 }
 
@@ -6099,7 +6400,11 @@ void QmlMainWindow::resizeSwapchain()
     const QSize window_size(width() * devicePixelRatio(), height() * devicePixelRatio());
     const bool swapchain_ready = quick_tex &&
                                  (render_backend != RenderBackend::OpenGL || quick_fbo) &&
-                                 (render_backend != RenderBackend::Vulkan || quick_vk_image);
+                                 (render_backend != RenderBackend::Vulkan || quick_vk_image)
+#if defined(Q_OS_WIN)
+                                 && (render_backend != RenderBackend::D3D11 || quick_d3d11_tex)
+#endif
+                                 ;
     if (window_size == swapchain_size && swapchain_ready)
         return;
 
@@ -6116,6 +6421,65 @@ void QmlMainWindow::resizeSwapchain()
 
     if (quick_frame)
         endFrame();
+
+#if defined(Q_OS_WIN)
+    if (render_backend == RenderBackend::D3D11) {
+        D3D11_TEXTURE2D_DESC tex_desc = {};
+        tex_desc.Width = new_swapchain_size.width();
+        tex_desc.Height = new_swapchain_size.height();
+        tex_desc.MipLevels = 1;
+        tex_desc.ArraySize = 1;
+        tex_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Usage = D3D11_USAGE_DEFAULT;
+        tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ID3D11Texture2D *new_quick_d3d11_tex = nullptr;
+        if (FAILED(placebo_d3d11->device->CreateTexture2D(&tex_desc, nullptr, &new_quick_d3d11_tex))) {
+            qCCritical(chiakiGui) << "Failed to create Qt Quick D3D11 render target texture";
+            return;
+        }
+        // Clear the new texture; the overlay can be composited before Qt Quick
+        // renders into it again, which would show up as garbage on the loading screen.
+        ID3D11RenderTargetView *clear_rtv = nullptr;
+        if (SUCCEEDED(placebo_d3d11->device->CreateRenderTargetView(new_quick_d3d11_tex, nullptr, &clear_rtv))) {
+            const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            d3d11_imm_ctx->ClearRenderTargetView(clear_rtv, black);
+            clear_rtv->Release();
+        }
+
+        struct pl_d3d11_wrap_params wrap_params = {
+            .tex = reinterpret_cast<ID3D11Resource *>(new_quick_d3d11_tex),
+            .fmt = DXGI_FORMAT_B8G8R8A8_UNORM,
+            .w = new_swapchain_size.width(),
+            .h = new_swapchain_size.height(),
+        };
+        pl_tex new_quick_tex = pl_d3d11_wrap(placeboGpu(), &wrap_params);
+        if (!new_quick_tex) {
+            qCCritical(chiakiGui) << "Failed to wrap Qt Quick D3D11 render target texture";
+            new_quick_d3d11_tex->Release();
+            return;
+        }
+
+        quick_window->setRenderTarget(QQuickRenderTarget());
+        if (quick_tex)
+            pl_tex_destroy(placeboGpu(), &quick_tex);
+        if (quick_d3d11_tex)
+            quick_d3d11_tex->Release();
+        quick_d3d11_tex = new_quick_d3d11_tex;
+        quick_tex = new_quick_tex;
+        swapchain_size = new_swapchain_size;
+        quick_window->setRenderTarget(QQuickRenderTarget::fromD3D11Texture(
+            quick_d3d11_tex, static_cast<uint>(DXGI_FORMAT_B8G8R8A8_UNORM), swapchain_size));
+        {
+            static bool rt_logged = false;
+            if (!rt_logged) {
+                rt_logged = true;
+                qCInfo(chiakiGui) << "[d3d11-diag] quick D3D11 render target set" << swapchain_size;
+            }
+        }
+        return;
+    }
+#endif
 
     if (render_backend == RenderBackend::OpenGL) {
         if (!makeOpenGLContextCurrent()) {
@@ -6229,8 +6593,14 @@ void QmlMainWindow::sync()
 {
     Q_ASSERT(QThread::currentThread() == render_thread);
 
-    if (!quick_tex)
+    if (!quick_tex) {
+        static bool sync_notex_logged = false;
+        if (!sync_notex_logged) {
+            sync_notex_logged = true;
+            qCWarning(chiakiGui) << "[d3d11-diag] sync: quick_tex null, skipping";
+        }
         return;
+    }
 
     const qint64 sync_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     const qint64 sync_begin_frame_begin_us = sync_begin_us;
@@ -6247,6 +6617,13 @@ void QmlMainWindow::sync()
         return;
     const qint64 sync_quick_render_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     quick_need_render.storeRelaxed(quick_render->sync() ? 1 : 0);
+    {
+        static bool sync_logged = false;
+        if (!sync_logged) {
+            sync_logged = true;
+            qCInfo(chiakiGui) << "[d3d11-diag] quick sync done, sceneChangedRender=" << (quick_need_render.loadRelaxed() != 0);
+        }
+    }
     const qint64 sync_quick_render_end_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
     if (sync_quick_render_end_us >= sync_quick_render_begin_us) {
         const qint64 sync_quick_render_us = sync_quick_render_end_us - sync_quick_render_begin_us;
@@ -6274,6 +6651,26 @@ void QmlMainWindow::beginFrame()
         quick_render->beginFrame();
         return;
     }
+
+#if defined(Q_OS_WIN)
+    if (render_backend == RenderBackend::D3D11) {
+        // Single shared immediate context; the render target was set in resizeSwapchain.
+        static bool quick_begin_logged = false;
+        if (!quick_begin_logged) {
+            quick_begin_logged = true;
+            qCInfo(chiakiGui) << "[d3d11-diag] quick beginFrame (D3D11), graphicsApi"
+                << quick_window->rendererInterface()->graphicsApi();
+        }
+        quick_frame = true;
+        quick_render->beginFrame();
+        static bool quick_begin_result_logged = false;
+        if (!quick_begin_result_logged) {
+            quick_begin_result_logged = true;
+            qCInfo(chiakiGui) << "[d3d11-diag] quick_render->beginFrame() called";
+        }
+        return;
+    }
+#endif
 
     if (!quick_tex || !quick_sem || !quick_vk_image)
         return;
@@ -6370,6 +6767,14 @@ void QmlMainWindow::endFrame()
         doneOpenGLContextCurrent();
         return;
     }
+
+#if defined(Q_OS_WIN)
+    if (render_backend == RenderBackend::D3D11) {
+        quick_frame = false;
+        quick_render->endFrame();
+        return;
+    }
+#endif
 
     quick_frame = false;
     const qint64 quick_end_qt_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -6791,21 +7196,44 @@ void QmlMainWindow::render()
             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
         }
         if (reset_direct_frame) {
-            pl_unmap_avframe(placeboGpu(), &direct_frame);
+#if defined(Q_OS_WIN)
+            if (is_d3d11_mapped(&direct_frame))
+                unmap_d3d11_frame(placeboGpu(), &direct_frame);
+            else
+#endif
+                pl_unmap_avframe(placeboGpu(), &direct_frame);
             direct_frame = {};
         }
         if (incoming) {
-            pl_unmap_avframe(placeboGpu(), &direct_frame);
-            direct_frame = {};
-            pl_avframe_params avparams = {};
-            avparams.frame = incoming;
-            avparams.tex = placebo_tex.data();
-            if (!pl_map_avframe_ex(placeboGpu(), &direct_frame, &avparams)) {
-                qCWarning(chiakiGui) << "Failed to map direct video frame";
+#if defined(Q_OS_WIN)
+            if (is_d3d11_mapped(&direct_frame))
+                unmap_d3d11_frame(placeboGpu(), &direct_frame);
+            else
+#endif
                 pl_unmap_avframe(placeboGpu(), &direct_frame);
-                direct_frame = {};
-                if (backend && backend->zeroCopy())
-                    backend->disableZeroCopy();
+            direct_frame = {};
+            if (incoming->format == AV_PIX_FMT_D3D11) {
+#if defined(Q_OS_WIN)
+                if (!map_d3d11_frame(placeboGpu(), &direct_frame, incoming)) {
+                    qCWarning(chiakiGui) << "Failed to map direct video frame";
+                    // pl_frame_from_avframe already populated planes; clear so the
+                    // mix doesn't render destroyed (null) textures
+                    direct_frame = {};
+                    if (backend && backend->zeroCopy())
+                        backend->disableZeroCopy();
+                }
+#endif
+            } else {
+                pl_avframe_params avparams = {};
+                avparams.frame = incoming;
+                avparams.tex = placebo_tex.data();
+                if (!pl_map_avframe_ex(placeboGpu(), &direct_frame, &avparams)) {
+                    qCWarning(chiakiGui) << "Failed to map direct video frame";
+                    pl_unmap_avframe(placeboGpu(), &direct_frame);
+                    direct_frame = {};
+                    if (backend && backend->zeroCopy())
+                        backend->disableZeroCopy();
+                }
             }
             av_frame_free(&incoming);
         }
@@ -6925,7 +7353,7 @@ void QmlMainWindow::render()
     updateQueueDepthAverage(snapshotQueueDepth());
     refreshPendingFrameAge();
 
-    if (render_backend == RenderBackend::OpenGL && quick_need_render.loadRelaxed()) {
+    if (rendersOnGuiThread() && quick_need_render.loadRelaxed()) {
         const bool quick_skip_next = stream_session_active.loadAcquire() != 0 && quick_render_skip_next != 0;
         if (quick_skip_next && !quick_frame) {
             quick_render_skip_next = 0;
@@ -6940,7 +7368,16 @@ void QmlMainWindow::render()
                 logQuickBeginFrameStats(quick_begin_after_us, quick_begin_after_us - quick_begin_begin_us);
             if (quick_frame) {
                 const qint64 quick_render_call_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-                clearQuickOpenGLTarget(quick_fbo);
+                if (render_backend == RenderBackend::OpenGL)
+                    clearQuickOpenGLTarget(quick_fbo);
+                {
+                    static bool qr_logged = false;
+                    if (!qr_logged) {
+                        qr_logged = true;
+                        qCInfo(chiakiGui) << "[d3d11-diag] quick_render->render() executing, graphicsApi"
+                            << quick_window->rendererInterface()->graphicsApi();
+                    }
+                }
                 quick_render->render();
                 const qint64 quick_render_call_after_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
                 if (quick_render_call_after_us >= quick_render_call_begin_us)
@@ -7431,6 +7868,14 @@ void QmlMainWindow::render()
                 const qint64 quick_render_call_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
                 if (render_backend == RenderBackend::OpenGL)
                     clearQuickOpenGLTarget(quick_fbo);
+                {
+                    static bool qr_logged = false;
+                    if (!qr_logged) {
+                        qr_logged = true;
+                        qCInfo(chiakiGui) << "[d3d11-diag] quick_render->render() executing, graphicsApi"
+                            << quick_window->rendererInterface()->graphicsApi();
+                    }
+                }
                 quick_render->render();
                 const qint64 quick_render_call_after_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
                 if (quick_render_call_after_us >= quick_render_call_begin_us)
@@ -7478,7 +7923,14 @@ void QmlMainWindow::render()
             logLatencyStats("render_prep", render_call_begin_us - render_entry_us_local);
         if (render_call_begin_us >= render_setup_begin_us)
             logRenderSetupStats(render_call_begin_us, render_call_begin_us - render_setup_begin_us);
-        const bool rendered = pl_render_image(placebo_renderer, nullptr, &target_frame, &params);
+        struct pl_render_params local_params = params;
+        struct pl_frame local_target = target_frame;
+        // Qt RHI leaves quick_tex bound as an OM render target after drawing
+        // the UI; a resource still bound as OM output gets its SRV binding
+        // silently nulled by D3D11, so the overlay would draw nothing.
+        if (d3d11_imm_ctx)
+            d3d11_imm_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        const bool rendered = pl_render_image(placebo_renderer, nullptr, &local_target, &local_params);
         if (!rendered) {
             qCWarning(chiakiGui) << "Failed to render held/overlay-only frame";
             close_started_frame(false);
@@ -7614,6 +8066,10 @@ void QmlMainWindow::render()
         logLatencyStats("render_prep", render_call_begin_us - render_entry_us_local);
     if (render_call_begin_us >= render_setup_begin_us)
         logRenderSetupStats(render_call_begin_us, render_call_begin_us - render_setup_begin_us);
+    // See the overlay-only path below: Qt RHI leaves quick_tex OM-bound, which
+    // silently nulls libplacebo's SRV binding for it.
+    if (d3d11_imm_ctx)
+        d3d11_imm_ctx->OMSetRenderTargets(0, nullptr, nullptr);
     if (!(bypass_frame_queue
         ? pl_render_image(placebo_renderer, &direct_render_frame, &target_frame, &params)
         : pl_render_image_mix(placebo_renderer, &frame_mix, &target_frame, &params)))

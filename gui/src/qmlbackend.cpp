@@ -11,6 +11,7 @@
 #include "macWakeSleep.h"
 #elif defined(Q_OS_WINDOWS)
 #include "windowsWakeSleep.h"
+#include "d3d11presenter.h"
 #endif
 #if CHIAKI_GUI_ENABLE_STEAM_SHORTCUT
 #include "steamtools.h"
@@ -32,6 +33,7 @@
 #include <QDesktopServices>
 #include <QtConcurrent>
 #include <QTimer>
+#include <QFile>
 
 extern "C" {
 #include <chiaki/time.h>
@@ -195,7 +197,7 @@ static inline bool frame_has_planes(const AVFrame *frame)
     return frame->data[0] && planes > 0;
 }
 
-static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_renderer)
+static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_renderer, bool use_d3d11_renderer)
 {
     if (!frame || !frame->hw_frames_ctx)
         return true;
@@ -206,6 +208,10 @@ static bool frame_can_use_direct_render(const AVFrame *frame, bool use_opengl_re
 #ifdef Q_OS_LINUX
     case AV_PIX_FMT_VAAPI:
         return !use_opengl_renderer;
+#endif
+#if defined(Q_OS_WINDOWS)
+    case AV_PIX_FMT_D3D11:
+        return use_d3d11_renderer;
 #endif
     default:
         return false;
@@ -227,6 +233,23 @@ static void msg_handler(QtMsgType type, const QMessageLogContext &context, const
 {
     QMutexLocker lock(&chiaki_log_mutex);
     if (!chiaki_log_ctx) {
+        // No session log exists in this window, so GUI messages would vanish
+        // on a hard crash (GUI subsystem has no stderr). Append to a startup
+        // file so a crash before StreamSession construction leaves evidence.
+        {
+            static QString startup_log_dir;
+            if (startup_log_dir.isEmpty())
+                startup_log_dir = GetLogBaseDir();
+            if (!startup_log_dir.isEmpty()) {
+                QFile f(startup_log_dir + "/gui_startup.log");
+                if (f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                    const char *level = type == QtDebugMsg ? "D" : type == QtInfoMsg ? "I"
+                        : type == QtWarningMsg ? "W" : type == QtCriticalMsg ? "C" : "F";
+                    f.write(QByteArray("[") + level + "] " + msg.toUtf8() + "\n");
+                    f.close();
+                }
+            }
+        }
         qt_msg_handler(type, context, msg);
         return;
     }
@@ -450,7 +473,7 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
     refreshPsnToken();
 }
 
-bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer)
+bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer, bool use_d3d11_renderer)
 {
     if (!frame.frame)
         return false;
@@ -461,7 +484,7 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
     if (!frame.frame->hw_frames_ctx)
         return frame_has_planes(frame.frame);
 
-    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer);
+    const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer, use_d3d11_renderer);
     if (direct_render)
         return frame_has_planes(frame.frame);
 
@@ -526,6 +549,11 @@ void QmlBackend::teardownSession()
     chiaki_log_mutex.lock();
     chiaki_log_ctx = nullptr;
     chiaki_log_mutex.unlock();
+
+#ifdef Q_OS_WINDOWS
+    if (d3d11_presenter)
+        d3d11_presenter->stop();
+#endif
 
     // 1) Stop any new signal deliveries from the session, most importantly the
     //    frame-thread FfmpegFrameAvailable handler.
@@ -978,6 +1006,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         logged_hw_transfer_failures.clear();
     }
     QStringList availableDecoders = settings_qml->availableDecoders();
+    qCInfo(chiakiGui) << "[d3d11-diag] createSession: hw_decoder =" << session_info.hw_decoder
+        << "available =" << availableDecoders.join(',');
     if (!session_info.hw_decoder.isEmpty()
         && session_info.hw_decoder != "auto"
         && session_info.hw_decoder != "none"
@@ -987,6 +1017,11 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         session_info.hw_decoder = "auto";
     }
     bool use_opengl_renderer = window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::OpenGL);
+#if defined(Q_OS_WINDOWS)
+    bool use_d3d11_renderer = window && window->runtimeRendererBackend() == static_cast<int>(RenderBackend::D3D11);
+#else
+    bool use_d3d11_renderer = false;
+#endif
     bool prefer_cuda = window && window->nvidiaCard() && availableDecoders.contains("cuda");
     auto fallbackVulkanDecoderForOpenGL = [&]() {
         if (!use_opengl_renderer || session_info.hw_decoder != "vulkan")
@@ -1055,7 +1090,12 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             session_info.hw_decoder = "vaapi";
         }
 #elif defined(Q_OS_WIN)
-        if(!use_opengl_renderer && availableDecoders.contains("vulkan"))
+        if(use_d3d11_renderer && availableDecoders.contains("d3d11va"))
+        {
+            qCInfo(chiakiGui) << "Auto hw decoder selecting d3d11va for D3D11 renderer backend";
+            session_info.hw_decoder = "d3d11va";
+        }
+        else if(!use_opengl_renderer && availableDecoders.contains("vulkan"))
         {
             qCInfo(chiakiGui) << "Auto hw decoder selecting vulkan";
             session_info.hw_decoder = "vulkan";
@@ -1079,8 +1119,50 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
 #endif
     }
     fallbackVulkanDecoderForOpenGL();
+#if defined(Q_OS_WINDOWS)
+    // A vulkan decoder is useless on the D3D11 backend: AV_PIX_FMT_VULKAN frames
+    // cannot map onto the D3D11 gpu, so they would CPU-copy through every frame.
+    if (use_d3d11_renderer && session_info.hw_decoder == "vulkan") {
+        if (availableDecoders.contains("d3d11va")) {
+            qCInfo(chiakiGui) << "Renderer backend is D3D11, falling back from vulkan decoder to d3d11va";
+            session_info.hw_decoder = "d3d11va";
+        } else {
+            qCInfo(chiakiGui) << "Renderer backend is D3D11, falling back from vulkan decoder to software decoder";
+            session_info.hw_decoder.clear();
+        }
+    }
+#endif
+#ifdef Q_OS_WINDOWS
+    if (!use_d3d11_renderer && session_info.hw_decoder == "d3d11va" && settings->GetDirectPresentD3D11()
+        && session_info.video_profile.codec != CHIAKI_CODEC_H265_HDR) {
+        qCInfo(chiakiGui) << "[d3d11-diag] D3D11 direct-present gate taken";
+        if (!d3d11_presenter)
+            d3d11_presenter = new D3D11Presenter(this);
+        qCInfo(chiakiGui) << "[d3d11-diag] calling D3D11Presenter::initialize";
+        if (d3d11_presenter->initialize(window,
+                static_cast<int>(session_info.video_profile.width),
+                static_cast<int>(session_info.video_profile.height))) {
+            session_info.hw_device_ctx = d3d11_presenter->avHwDeviceCtx();
+            qCInfo(chiakiGui) << "Using D3D11 direct presentation for this session";
+        } else {
+            d3d11_presenter->stop();
+            qCInfo(chiakiGui) << "D3D11 direct presentation unavailable, using regular render path";
+        }
+    }
+#endif
+#if defined(Q_OS_WINDOWS)
+    if (use_d3d11_renderer && session_info.hw_decoder == "d3d11va") {
+        session_info.hw_device_ctx = window->d3d11HwDeviceCtx();
+        if (session_info.hw_device_ctx)
+            qCInfo(chiakiGui) << "[d3d11-backend] using libplacebo d3d11 zero-copy path";
+        else
+            qCInfo(chiakiGui) << "[d3d11-backend] d3d11 decode context unavailable, using regular render path";
+    }
+#endif
     if (session_info.hw_decoder == "vulkan") {
+        qCInfo(chiakiGui) << "[d3d11-diag] calling vulkanHwDeviceCtx";
         session_info.hw_device_ctx = window->vulkanHwDeviceCtx();
+        qCInfo(chiakiGui) << "[d3d11-diag] vulkanHwDeviceCtx returned" << session_info.hw_device_ctx;
         if (!session_info.hw_device_ctx)
         {
             session_info.hw_decoder.clear();
@@ -1113,6 +1195,8 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             qCInfo(chiakiGui) << "Falling back to software decoder";
     }
 
+    qCInfo(chiakiGui) << "[d3d11-diag] hw_device_ctx before StreamSession:" << session_info.hw_device_ctx
+        << "hw_decoder:" << session_info.hw_decoder;
     try {
         session = new StreamSession(session_info, this);
     } catch (const Exception &e) {
@@ -1120,7 +1204,7 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
         return;
     }
 
-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
+    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer, use_d3d11_renderer]() {
         ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
         if (!decoder) {
             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
@@ -1136,7 +1220,13 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
             pending_recovered_frame.storeRelaxed(1);
 
         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
-        if (!prepareFrameForPresentation(frame, use_opengl_renderer))
+#ifdef Q_OS_WINDOWS
+        if (d3d11_presenter && d3d11_presenter->active() && d3d11_presenter->presentD3D11Frame(frame.frame)) {
+            av_frame_free(&frame.frame);
+            return;
+        }
+#endif
+        if (!prepareFrameForPresentation(frame, use_opengl_renderer, use_d3d11_renderer))
         {
             av_frame_free(&frame.frame);
             return;

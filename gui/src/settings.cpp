@@ -702,6 +702,9 @@ void Settings::SetPlaceboPreset(PlaceboPreset preset)
 static const QMap<RenderBackend, QString> render_backend_values = {
 	{ RenderBackend::Vulkan, "vulkan" },
 	{ RenderBackend::OpenGL, "opengl" },
+#ifdef Q_OS_WINDOWS
+	{ RenderBackend::D3D11, "d3d11" },
+#endif
 };
 
 static const RenderBackend render_backend_default = RenderBackend::Vulkan;
@@ -709,6 +712,8 @@ static const RenderBackend render_backend_default = RenderBackend::Vulkan;
 RenderBackend Settings::GetRenderBackend() const
 {
 	auto v = settings.value("settings/render_backend", render_backend_values[render_backend_default]).toString();
+	// On non-Windows the map has no d3d11 entry, so an accidental
+	// settings/render_backend=d3d11 already resolves to the default here.
 	return render_backend_values.key(v, render_backend_default);
 }
 

@@ -673,8 +673,13 @@ int QmlSettings::rendererBackend() const
 
 void QmlSettings::setRendererBackend(int backend)
 {
+#ifdef Q_OS_WINDOWS
+    const int max_backend = static_cast<int>(RenderBackend::D3D11);
+#else
+    const int max_backend = static_cast<int>(RenderBackend::OpenGL);
+#endif
     if (backend < static_cast<int>(RenderBackend::Vulkan) ||
-        backend > static_cast<int>(RenderBackend::OpenGL)) {
+        backend > max_backend) {
         qWarning() << "Ignoring invalid renderer backend value:" << backend;
         return;
     }

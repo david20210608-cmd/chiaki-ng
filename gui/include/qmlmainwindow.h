@@ -24,6 +24,13 @@ extern "C" {
 #include <libplacebo/cache.h>
 }
 
+// libplacebo/d3d11.h pulls in the C++ Windows SDK headers (<d3d11.h> carries
+// inline operator==/!= declarations); it must stay outside extern "C". The
+// libplacebo headers self-wrap their own API via PL_API_BEGIN.
+#if defined(Q_OS_WIN)
+#include <libplacebo/d3d11.h>
+#endif
+
 #include <vulkan/vulkan.h>
 #if defined(Q_OS_LINUX)
 #include <xcb/xcb.h>
@@ -33,6 +40,8 @@ extern "C" {
 #include <vulkan/vulkan_metal.h>
 #elif defined(Q_OS_WIN)
 #include <vulkan/vulkan_win32.h>
+#include <d3d11.h>
+#include <d3d11_4.h>
 #endif
 
 Q_DECLARE_LOGGING_CATEGORY(chiakiGui);
@@ -168,6 +177,10 @@ public slots:
     void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);
 
     AVBufferRef *vulkanHwDeviceCtx();
+#if defined(Q_OS_WIN)
+    AVBufferRef *d3d11HwDeviceCtx();
+    bool isD3D11Backend() const { return render_backend == RenderBackend::D3D11; }
+#endif
 
 signals:
     void hasVideoChanged();
@@ -192,6 +205,9 @@ private:
 
     bool makeOpenGLContextCurrent();
     void doneOpenGLContextCurrent();
+    // OpenGL and D3D11 render on the GUI thread (single shared context);
+    // Vulkan uses the dedicated render thread.
+    bool rendersOnGuiThread() const { return render_backend != RenderBackend::Vulkan; }
 
     void init(Settings *settings, bool exit_app_on_stream_exit = false);
     pl_gpu placeboGpu() const;
@@ -327,6 +343,9 @@ private:
     QmlBackend *backend = {};
     StreamSession *session = {};
     AVBufferRef *vulkan_hw_dev_ctx = nullptr;
+#if defined(Q_OS_WIN)
+    AVBufferRef *d3d11_hw_dev_ctx = nullptr;
+#endif
     std::atomic<double> queue_depth_average{0.0};
     QAtomicInteger<int> queue_depth_cached = 0;
     double pending_frame_age = 0.0;
@@ -340,6 +359,9 @@ private:
     pl_vk_inst placebo_vk_inst = {};
     pl_vulkan placebo_vulkan = {};
     pl_opengl placebo_opengl = {};
+#if defined(Q_OS_WIN)
+    pl_d3d11 placebo_d3d11 = {};
+#endif
     pl_swapchain placebo_swapchain = {};
     pl_renderer placebo_renderer = {};
     pl_queue placebo_queue = {};
@@ -425,6 +447,11 @@ private:
     VkFormat quick_vk_format = VK_FORMAT_UNDEFINED;
     pl_tex quick_tex = {};
     QOpenGLFramebufferObject *quick_fbo = {};
+#if defined(Q_OS_WIN)
+    ID3D11Texture2D *quick_d3d11_tex = nullptr;
+    ID3D11DeviceContext *d3d11_imm_ctx = nullptr;
+    CRITICAL_SECTION d3d11_av_lock = {};
+#endif
     VkSemaphore quick_sem = VK_NULL_HANDLE;
     uint64_t quick_sem_value = 0;
     VkImage quick_vk_image = VK_NULL_HANDLE;
