@@ -282,6 +282,7 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	if(!ensureOutputSize(win_w, win_h))
 		return false;
 
+	direct_failure_streak = 0;
 	initialized = true;
 	qCInfo(chiakiGui) << "[d3d11-direct] active:" << stream_width << "x" << stream_height
 		<< "->" << win_w << "x" << win_h
@@ -402,52 +403,81 @@ bool D3D11Presenter::presentD3D11Frame(AVFrame *frame)
 
 	if(!updateGeometry())
 		return false;
-	return presentSurface(decoder_texture, array_slice);
+	if(presentSurface(decoder_texture, array_slice))
+	{
+		direct_failure_streak = 0;
+		return true;
+	}
+	// A permanently failing direct path must not leave the black child window
+	// covering the fallback render output, so tear it down after ~2 seconds.
+	constexpr int kFailureGiveUpFrames = 120;
+	if(++direct_failure_streak == kFailureGiveUpFrames)
+	{
+		qCWarning(chiakiGui) << "[d3d11-direct] present keeps failing, removing direct window"
+			"- frames fall back to the regular render path";
+		stop();
+	}
+	return false;
 }
 
 bool D3D11Presenter::presentSurface(ID3D11Texture2D *decoder_texture, unsigned int array_slice)
 {
-	// Copy the decoder surface into our own NV12 texture so the video processor
-	// input view does not depend on driver quirks around D3D11_BIND_DECODER
-	// surfaces. GPU-to-GPU copy, no CPU involvement.
-	D3D11_TEXTURE2D_DESC want;
-	decoder_texture->GetDesc(&want);
-	want.BindFlags = D3D11_BIND_RENDER_TARGET;
-	want.MiscFlags = 0;
-	want.CPUAccessFlags = 0;
-
-	bool need_create = !nv12_texture;
-	if(nv12_texture)
-	{
-		D3D11_TEXTURE2D_DESC have;
-		nv12_texture->GetDesc(&have);
-		need_create = have.Width != want.Width || have.Height != want.Height ||
-			have.Format != want.Format || have.ArraySize != want.ArraySize;
-	}
-	if(need_create)
-	{
-		if(nv12_texture)
-			nv12_texture->Release();
-		nv12_texture = nullptr;
-		if(FAILED(device->CreateTexture2D(&want, nullptr, &nv12_texture)))
-		{
-			qCWarning(chiakiGui) << "[d3d11-direct] NV12 texture creation failed";
-			return false;
-		}
-	}
-
-	context->CopySubresourceRegion(nv12_texture, array_slice, 0, 0, 0, decoder_texture, array_slice, nullptr);
-
+	// Prefer wrapping the decoder surface directly: input views on
+	// D3D11_BIND_DECODER textures are the canonical VideoProcessor path.
 	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {};
 	in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
 	in_desc.Texture2D.MipSlice = 0;
 	in_desc.Texture2D.ArraySlice = array_slice;
 	ID3D11VideoProcessorInputView *input_view = nullptr;
-	if(FAILED(video_device->CreateVideoProcessorInputView(nv12_texture, vp_enumerator, &in_desc, &input_view)))
+	ID3D11Texture2D *input_texture = decoder_texture;
+	HRESULT view_hr = video_device->CreateVideoProcessorInputView(input_texture, vp_enumerator, &in_desc, &input_view);
+	if(FAILED(view_hr))
 	{
-		static bool view_logged = false;
-		logHrOnce("VideoProcessorInputView", E_FAIL, &view_logged);
-		return false;
+		// Fallback: copy into our own single-slice NV12 texture. Copying the
+		// selected slice into slice 0 avoids cloning the decoder pool's array
+		// size; note RT bind flags on NV12 are not universally supported, so
+		// the create failure is logged with its real HRESULT.
+		static bool direct_view_logged = false;
+		logHrOnce("VideoProcessorInputView on decoder surface", view_hr, &direct_view_logged);
+
+		D3D11_TEXTURE2D_DESC want;
+		decoder_texture->GetDesc(&want);
+		want.BindFlags = D3D11_BIND_RENDER_TARGET;
+		want.MiscFlags = 0;
+		want.CPUAccessFlags = 0;
+		want.ArraySize = 1;
+
+		bool need_create = !nv12_texture;
+		if(nv12_texture)
+		{
+			D3D11_TEXTURE2D_DESC have;
+			nv12_texture->GetDesc(&have);
+			need_create = have.Width != want.Width || have.Height != want.Height || have.Format != want.Format;
+		}
+		if(need_create)
+		{
+			if(nv12_texture)
+				nv12_texture->Release();
+			nv12_texture = nullptr;
+			HRESULT tex_hr = device->CreateTexture2D(&want, nullptr, &nv12_texture);
+			if(FAILED(tex_hr))
+			{
+				static bool tex_logged = false;
+				logHrOnce("NV12 texture creation", tex_hr, &tex_logged);
+				return false;
+			}
+		}
+
+		context->CopySubresourceRegion(nv12_texture, 0, 0, 0, 0, decoder_texture, array_slice, nullptr);
+		in_desc.Texture2D.ArraySlice = 0;
+		input_texture = nv12_texture;
+		HRESULT copy_view_hr = video_device->CreateVideoProcessorInputView(input_texture, vp_enumerator, &in_desc, &input_view);
+		if(FAILED(copy_view_hr))
+		{
+			static bool view_logged = false;
+			logHrOnce("VideoProcessorInputView on copy", copy_view_hr, &view_logged);
+			return false;
+		}
 	}
 
 	D3D11_VIDEO_PROCESSOR_STREAM stream = {};

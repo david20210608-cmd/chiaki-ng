@@ -51,6 +51,7 @@ class D3D11Presenter : public QObject
 		int last_y = -1;
 		int last_w = -1;
 		int last_h = -1;
+		int direct_failure_streak = 0;
 
 		void *window_handle = nullptr; // child HWND
 		QWindow *parent_qwindow = nullptr;
