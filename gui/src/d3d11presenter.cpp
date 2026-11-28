@@ -143,7 +143,13 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 		qCWarning(chiakiGui) << "[d3d11-direct] av_hwdevice_ctx_alloc failed";
 		return false;
 	}
-	auto *av_ctx = reinterpret_cast<AVD3D11VADeviceContext *>(av_hw_device_ctx->data);
+	// AVBufferRef::data points at the outer AVHWDeviceContext; the D3D11
+	// context lives one level down in ->hwctx. Casting data directly wrote the
+	// fields over AVHWDeviceContext's own members (unlock landed on the slot
+	// av_hwdevice_ctx_init reads the hw_type table pointer from), so init
+	// jumped through function code bytes and crashed with 0xc0000005.
+	auto *av_ctx = reinterpret_cast<AVD3D11VADeviceContext *>(
+		reinterpret_cast<AVHWDeviceContext *>(av_hw_device_ctx->data)->hwctx);
 	av_ctx->device = device;
 	av_ctx->device_context = context;
 	av_ctx->video_device = video_device;
