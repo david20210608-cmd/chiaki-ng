@@ -266,6 +266,6 @@ jobs:
           $installer = "chiaki-ng-windows-installer-$($env:GITHUB_SHA.Substring(0,8)).exe"
           cp chiaki-ng-windows-installer.exe $installer
           $notes = "Automated Windows x64 build of commit $($env:GITHUB_SHA.Substring(0,8)) ($($env:GITHUB_REF_NAME)).`n`nAssets: portable zip and installer exe.`nArtifact `chiaki-ng-win_x64-VC-Release` remains available under the run's Artifacts section for 7 days."
-          gh release create $tag $installer $env:RELEASE_PACKAGE_PATH --title "Windows x64 latest build ($($env:GITHUB_SHA.Substring(0,8)))" --notes $notes --prerelease
+          gh release create $tag $installer $env:RELEASE_PACKAGE_PATH --target $env:GITHUB_SHA --title "Windows x64 latest build ($($env:GITHUB_SHA.Substring(0,8)))" --notes $notes --prerelease
 
 # build mirror: chiaki-ng-build (fork Actions disabled by GitHub)
