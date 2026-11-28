@@ -151,6 +151,11 @@ bool D3D11Presenter::initialize(QWindow *parent_window, int frame_width, int fra
 	av_ctx->lock = av_lock_cb;
 	av_ctx->unlock = av_unlock_cb;
 	av_ctx->lock_ctx = av_lock;
+	// FFmpeg's frame pool takes BindFlags from the device context; the DECODER
+	// default normally comes from av_hwdevice_ctx_create's own device creation.
+	// Without it the pool has no bind flags and CreateVideoDecoderOutputView
+	// rejects every surface, so decoding fails from the first frame.
+	av_ctx->BindFlags = D3D11_BIND_DECODER;
 	device->AddRef();
 	context->AddRef();
 	video_device->AddRef();
